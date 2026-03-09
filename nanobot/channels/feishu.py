@@ -1109,12 +1109,20 @@ class FeishuChannel(BaseChannel):
                     )
 
                     if image_keys:
-                        # 构建包含图片的卡片
-                        card = self._build_card_with_images(msg.content, image_keys)
-                        await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
-                        )
+                        # 先发送文本内容（移除图片标记）
+                        text_only = re.sub(image_pattern, '', msg.content).strip()
+                        if text_only:
+                            text_body = json.dumps({"text": text_only}, ensure_ascii=False)
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "text", text_body,
+                            )
+                        # 再单独发送每张图片
+                        for img_key in image_keys:
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "image", json.dumps({"image_key": img_key}, ensure_ascii=False),
+                            )
                     else:
                         # 图片上传失败，回退到普通格式检测
                         fmt = self._detect_msg_format(msg.content)
