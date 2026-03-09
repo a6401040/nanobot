@@ -851,6 +851,67 @@ class FeishuChannel(BaseChannel):
             logger.error("Error getting tenant_access_token: {}", e)
             return None
 
+
+    def _download_image_from_url(self, image_url: str) -> str | None:
+        """
+        从网络 URL 下载图片到本地临时文件。
+
+        Args:
+            image_url: 图片的网络 URL
+
+        Returns:
+            本地临时文件路径或 None
+        """
+        import requests
+        import tempfile
+        from pathlib import Path
+        import hashlib
+
+        try:
+            # 设置请求头，模拟浏览器访问
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            }
+
+            # 下载图片
+            response = requests.get(image_url, headers=headers, timeout=30, allow_redirects=True)
+
+            if response.status_code == 200:
+                # 获取文件扩展名
+                content_type = response.headers.get('Content-Type', '')
+                ext = '.jpg'
+                if 'png' in content_type:
+                    ext = '.png'
+                elif 'gif' in content_type:
+                    ext = '.gif'
+                elif 'webp' in content_type:
+                    ext = '.webp'
+                elif 'jpeg' in content_type or 'jpg' in content_type:
+                    ext = '.jpg'
+
+                # 创建临时文件
+                temp_dir = Path(tempfile.gettempdir()) / "nanobot_feishu_images"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+
+                # 生成临时文件名
+                url_hash = hashlib.md5(image_url.encode()).hexdigest()[:16]
+                temp_file = temp_dir / f"{url_hash}{ext}"
+
+                # 保存图片
+                temp_file.write_bytes(response.content)
+                logger.debug("Downloaded image from {} to {}", image_url, temp_file)
+
+                return str(temp_file)
+            else:
+                logger.warning("Failed to download image from {}: status={}", image_url, response.status)
+                return None
+
+        except Exception as e:
+            logger.error("Error downloading image from {}: {}", image_url, e)
+            return None
+
     def _download_image_sync(self, message_id: str, image_key: str) -> tuple[bytes | None, str | None]:
         """Download an image from Feishu message by message_id and image_key."""
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
@@ -986,20 +1047,36 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
+            # 处理附件媒体文件
             for file_path in msg.media:
-                if not os.path.isfile(file_path):
-                    logger.warning("Media file not found: {}", file_path)
-                    continue
-                ext = os.path.splitext(file_path)[1].lower()
+                # 判断是网络 URL 还是本地文件
+                is_url = file_path.startswith(('http://', 'https://'))
+
+                if is_url:
+                    # 下载网络图片
+                    logger.info("Downloading media from URL: {}", file_path)
+                    local_path = await loop.run_in_executor(None, self._download_image_from_url, file_path)
+                    if not local_path:
+                        logger.warning("Failed to download media from URL: {}", file_path)
+                        continue
+                    actual_path = local_path
+                else:
+                    # 本地文件路径
+                    if not os.path.isfile(file_path):
+                        logger.warning("Media file not found: {}", file_path)
+                        continue
+                    actual_path = file_path
+
+                ext = os.path.splitext(actual_path)[1].lower()
                 if ext in self._IMAGE_EXTS:
-                    key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+                    key = await loop.run_in_executor(None, self._upload_image_sync, actual_path)
                     if key:
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
                         )
                 else:
-                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                    key = await loop.run_in_executor(None, self._upload_file_sync, actual_path)
                     if key:
                         # Use msg_type "media" for audio/video so users can play inline;
                         # "file" for everything else (documents, archives, etc.)
@@ -1011,6 +1088,14 @@ class FeishuChannel(BaseChannel):
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
+
+                # 清理临时下载的文件
+                if is_url and actual_path and os.path.exists(actual_path):
+                    try:
+                        os.remove(actual_path)
+                        logger.debug("Cleaned up temp file: {}", actual_path)
+                    except Exception as e:
+                        logger.warning("Failed to clean up temp file {}: {}", actual_path, e)
 
             if msg.content and msg.content.strip():
                 # 检测是否包含 Markdown 图片语法
