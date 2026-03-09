@@ -665,6 +665,192 @@ class FeishuChannel(BaseChannel):
             logger.error("Error uploading file {}: {}", file_path, e)
             return None
 
+
+    def _extract_and_upload_images_sync(self, content: str) -> tuple[str, list[str]]:
+        """
+        从 Markdown 内容中提取图片路径，上传到飞书，并替换为 imageKey。
+
+        Args:
+            content: 包含 Markdown 图片语法的文本内容
+
+        Returns:
+            tuple: (替换后的内容, imageKey 列表)
+        """
+        import re
+
+        # Markdown 图片语法: ![alt](path)
+        image_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+
+        image_keys = []
+
+        def replace_image(match: re.Match) -> str:
+            """替换单个图片引用为 imageKey。"""
+            alt_text = match.group(1)
+            image_path = match.group(2)
+
+            # 检查路径是否有效
+            if not image_path or not os.path.isfile(image_path):
+                logger.warning("Image file not found: {}", image_path)
+                return match.group(0)  # 保留原始标记
+
+            # 首先尝试使用 SDK 上传
+            image_key = self._upload_image_sync(image_path)
+
+            # 如果 SDK 方式失败，尝试 HTTP 直接上传
+            if not image_key:
+                logger.info("SDK upload failed, trying HTTP upload for: {}", image_path)
+                image_key = self._upload_image_http_sync(image_path)
+
+            if image_key:
+                image_keys.append(image_key)
+                # 返回飞书卡片格式的图片引用
+                return f'{{{{img:{image_key}}}}}'
+            else:
+                logger.error("Failed to upload image: {}", image_path)
+                return match.group(0)  # 上传失败保留原始标记
+
+        # 替换所有图片引用
+        new_content = re.sub(image_pattern, replace_image, content)
+
+        return new_content, image_keys
+
+    def _build_card_with_images(self, content: str, image_keys: list[str]) -> dict:
+        """
+        构建包含图片的飞书卡片。
+
+        Args:
+            content: 文本内容
+            image_keys: 图片 key 列表
+
+        Returns:
+            飞书卡片字典
+        """
+        elements = []
+
+        # 添加文本内容
+        if content.strip():
+            # 移除图片标记，保留纯文本
+            import re
+            text_only = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', r'[\1]', content)
+            text_only = re.sub(r'\{\{img:[^}]+\}\}', '', text_only).strip()
+
+            if text_only:
+                elements.append({
+                    "tag": "markdown",
+                    "content": text_only
+                })
+
+        # 添加图片元素
+        for img_key in image_keys:
+            elements.append({
+                "tag": "img",
+                "img_key": img_key,
+                "alt": {
+                    "tag": "plain_text",
+                    "content": "图片"
+                }
+            })
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "elements": elements
+        }
+
+    def _upload_image_http_sync(self, file_path: str) -> str | None:
+        """
+        使用 HTTP 直接上传图片到飞书（备用方法）。
+        参考官方 API 文档实现。
+
+        Args:
+            file_path: 图片文件路径
+
+        Returns:
+            image_key 或 None
+        """
+        try:
+            from requests_toolbelt import MultipartEncoder
+            import requests
+        except ImportError:
+            logger.error("requests_toolbelt not installed. Run: pip install requests_toolbelt")
+            return None
+
+        url = "https://open.feishu.cn/open-apis/im/v1/images"
+
+        try:
+            # 获取 tenant_access_token
+            token = self._get_tenant_access_token()
+            if not token:
+                logger.error("Failed to get tenant_access_token")
+                return None
+
+            # 构建 multipart 表单
+            with open(file_path, 'rb') as f:
+                form = {
+                    'image_type': 'message',
+                    'image': (os.path.basename(file_path), f, 'application/octet-stream')
+                }
+                multi_form = MultipartEncoder(form)
+
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': multi_form.content_type
+                }
+
+                response = requests.post(url, headers=headers, data=multi_form)
+
+            # 记录 log_id 用于调试
+            log_id = response.headers.get('X-Tt-Logid', 'unknown')
+            logger.debug("Feishu image upload log_id: {}", log_id)
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('code') == 0:
+                    image_key = result['data']['image_key']
+                    logger.debug("Uploaded image {} via HTTP: {}", os.path.basename(file_path), image_key)
+                    return image_key
+                else:
+                    logger.error("Failed to upload image via HTTP: code={}, msg={}",
+                               result.get('code'), result.get('msg'))
+                    return None
+            else:
+                logger.error("HTTP upload failed: status={}, response={}",
+                           response.status_code, response.text)
+                return None
+
+        except Exception as e:
+            logger.error("Error uploading image via HTTP {}: {}", file_path, e)
+            return None
+
+    def _get_tenant_access_token(self) -> str | None:
+        """
+        获取飞书的 tenant_access_token。
+
+        Returns:
+            token 字符串或 None
+        """
+        try:
+            from lark_oapi.api.auth.v3 import InternalTenantAccessTokenRequest, InternalTenantAccessTokenRequestBody
+
+            request = InternalTenantAccessTokenRequest.builder() \
+                .request_body(
+                    InternalTenantAccessTokenRequestBody.builder()
+                    .app_id(self.config.app_id)
+                    .app_secret(self.config.app_secret)
+                    .build()
+                ).build()
+
+            response = self._client.auth.v3.tenant_access_token.internal(request)
+
+            if response.success():
+                return response.data.tenant_access_token
+            else:
+                logger.error("Failed to get tenant_access_token: code={}, msg={}",
+                           response.code, response.msg)
+                return None
+        except Exception as e:
+            logger.error("Error getting tenant_access_token: {}", e)
+            return None
+
     def _download_image_sync(self, message_id: str, image_key: str) -> tuple[bytes | None, str | None]:
         """Download an image from Feishu message by message_id and image_key."""
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
@@ -827,33 +1013,76 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                fmt = self._detect_msg_format(msg.content)
+                # 检测是否包含 Markdown 图片语法
+                image_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+                has_images = re.search(image_pattern, msg.content)
 
-                if fmt == "text":
-                    # Short plain text – send as simple text message
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
-                    await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "text", text_body,
+                if has_images:
+                    # 包含图片，提取并上传，构建带图片的卡片
+                    new_content, image_keys = await loop.run_in_executor(
+                        None, self._extract_and_upload_images_sync, msg.content
                     )
 
-                elif fmt == "post":
-                    # Medium content with links – send as rich-text post
-                    post_body = self._markdown_to_post(msg.content)
-                    await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "post", post_body,
-                    )
-
-                else:
-                    # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
-                    for chunk in self._split_elements_by_table_limit(elements):
-                        card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                    if image_keys:
+                        # 构建包含图片的卡片
+                        card = self._build_card_with_images(msg.content, image_keys)
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
                         )
+                    else:
+                        # 图片上传失败，回退到普通格式检测
+                        fmt = self._detect_msg_format(msg.content)
+
+                        if fmt == "text":
+                            text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "text", text_body,
+                            )
+                        elif fmt == "post":
+                            post_body = self._markdown_to_post(msg.content)
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "post", post_body,
+                            )
+                        else:
+                            elements = self._build_card_elements(msg.content)
+                            for chunk in self._split_elements_by_table_limit(elements):
+                                card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                                await loop.run_in_executor(
+                                    None, self._send_message_sync,
+                                    receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                                )
+                else:
+                    # 不包含图片，使用原有逻辑
+                    fmt = self._detect_msg_format(msg.content)
+
+                    if fmt == "text":
+                        # Short plain text – send as simple text message
+                        text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                        await loop.run_in_executor(
+                            None, self._send_message_sync,
+                            receive_id_type, msg.chat_id, "text", text_body,
+                        )
+
+                    elif fmt == "post":
+                        # Medium content with links – send as rich-text post
+                        post_body = self._markdown_to_post(msg.content)
+                        await loop.run_in_executor(
+                            None, self._send_message_sync,
+                            receive_id_type, msg.chat_id, "post", post_body,
+                        )
+
+                    else:
+                        # Complex / long content – send as interactive card
+                        elements = self._build_card_elements(msg.content)
+                        for chunk in self._split_elements_by_table_limit(elements):
+                            card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                            )
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
